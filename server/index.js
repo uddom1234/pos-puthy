@@ -83,6 +83,23 @@ async function ensureTransactionsSchema() {
   }
 }
 
+// Ensure orders table has payment status
+async function ensureOrdersSchema() {
+  const pool = getPool();
+  // Add payment_status column if missing
+  try {
+    await pool.query("ALTER TABLE orders ADD COLUMN payment_status ENUM('unpaid','paid','partial') NOT NULL DEFAULT 'unpaid' AFTER status");
+  } catch (e) {
+    if (!(e && (e.code === 'ER_DUP_FIELDNAME' || e.errno === 1060))) throw e;
+  }
+  // Add payment_method column if missing
+  try {
+    await pool.query("ALTER TABLE orders ADD COLUMN payment_method ENUM('cash','qr') NULL AFTER payment_status");
+  } catch (e) {
+    if (!(e && (e.code === 'ER_DUP_FIELDNAME' || e.errno === 1060))) throw e;
+  }
+}
+
 // Authentication middleware
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
@@ -539,7 +556,7 @@ app.get('/api/orders', authenticateToken, async (req, res) => {
   try {
     const pool = getPool();
     const [rows] = await pool.query(
-      `SELECT id, customer_id AS customerId, items, total, status, created_at AS createdAt, table_number AS tableNumber, notes, metadata
+      `SELECT id, customer_id AS customerId, items, total, status, payment_status AS paymentStatus, payment_method AS paymentMethod, created_at AS createdAt, table_number AS tableNumber, notes, metadata
        FROM orders WHERE user_id = ? ORDER BY created_at DESC`,
       [Number(req.user.id)]
     );
@@ -560,9 +577,9 @@ app.post('/api/orders', authenticateToken, async (req, res) => {
     const pool = getPool();
     const createdAt = new Date();
     const [result] = await pool.query(
-      `INSERT INTO orders (customer_id, items, total, status, created_at, table_number, notes, metadata, user_id)
-       VALUES (?,?,?,?,?,?,?,?,?)`,
-      [req.body.customerId ? Number(req.body.customerId) : null, JSON.stringify(req.body.items || []), req.body.total, 'pending', createdAt, req.body.tableNumber || null, req.body.notes || null, req.body.metadata ? JSON.stringify(req.body.metadata) : null, Number(req.user.id)]
+      `INSERT INTO orders (customer_id, items, total, status, payment_status, payment_method, created_at, table_number, notes, metadata, user_id)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+      [req.body.customerId ? Number(req.body.customerId) : null, JSON.stringify(req.body.items || []), req.body.total, 'pending', req.body.paymentStatus || 'unpaid', req.body.paymentMethod || null, createdAt, req.body.tableNumber || null, req.body.notes || null, req.body.metadata ? JSON.stringify(req.body.metadata) : null, Number(req.user.id)]
     );
     res.status(201).json({ id: String(result.insertId), ...req.body, createdAt, status: 'pending' });
   } catch (error) {
@@ -576,7 +593,7 @@ app.put('/api/orders/:id', authenticateToken, async (req, res) => {
     const pool = getPool();
     const fields = [];
     const values = [];
-    const mapping = { customerId: 'customer_id', items: 'items', total: 'total', status: 'status', tableNumber: 'table_number', notes: 'notes', metadata: 'metadata' };
+    const mapping = { customerId: 'customer_id', items: 'items', total: 'total', status: 'status', paymentStatus: 'payment_status', paymentMethod: 'payment_method', tableNumber: 'table_number', notes: 'notes', metadata: 'metadata' };
     for (const [key, col] of Object.entries(mapping)) {
       if (req.body[key] !== undefined) {
         let v = req.body[key];
@@ -601,6 +618,105 @@ app.put('/api/orders/:id/status', authenticateToken, async (req, res) => {
     res.json({ id: req.params.id, status: req.body.status });
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+app.put('/api/orders/:id/payment', authenticateToken, async (req, res) => {
+  const pool = getPool();
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    
+    const { paymentStatus, paymentMethod, discount = 0, cashReceived } = req.body;
+    const orderId = req.params.id;
+    
+    // Get the order details
+    const [orderRows] = await conn.query('SELECT * FROM orders WHERE id = ?', [orderId]);
+    const order = orderRows[0];
+    
+    if (!order) {
+      await conn.rollback();
+      conn.release();
+      return res.status(404).json({ message: 'Order not found' });
+    }
+    
+    // Update order payment status
+    const fields = [];
+    const values = [];
+    
+    if (paymentStatus) {
+      fields.push('payment_status = ?');
+      values.push(paymentStatus);
+    }
+    if (paymentMethod) {
+      fields.push('payment_method = ?');
+      values.push(paymentMethod);
+    }
+    
+    if (fields.length === 0) {
+      await conn.rollback();
+      conn.release();
+      return res.status(400).json({ message: 'No payment fields to update' });
+    }
+    
+    values.push(orderId);
+    await conn.query(`UPDATE orders SET ${fields.join(', ')} WHERE id = ?`, values);
+    
+    // If payment is completed, create a transaction record
+    if (paymentStatus === 'paid') {
+      const total = Number(order.total) - Number(discount);
+      const now = new Date();
+      
+      let changeBack = null;
+      if (paymentMethod === 'cash' && cashReceived) {
+        changeBack = Number((Number(cashReceived) - total).toFixed(2));
+      }
+      
+      const [txResult] = await conn.query(
+        `INSERT INTO transactions (subtotal, discount, total, payment_method, cash_received, change_back, status, date, user_id, customer_id, loyalty_points_used, loyalty_points_earned)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          Number(order.total),
+          Number(discount),
+          total,
+          paymentMethod,
+          cashReceived ? Number(cashReceived) : null,
+          changeBack,
+          'paid',
+          now,
+          Number(req.user.id),
+          order.customer_id,
+          0, // loyalty points used
+          0  // loyalty points earned
+        ]
+      );
+      const txId = txResult.insertId;
+      
+      // Parse order items and create transaction items
+      const items = safeJsonParse(order.items, []);
+      for (const item of items) {
+        await conn.query(
+          `INSERT INTO transaction_items (transaction_id, product_id, product_name, quantity, price, customizations)
+           VALUES (?,?,?,?,?,?)`,
+          [txId, item.productId ? Number(item.productId) : null, item.productName, item.quantity, item.price, item.customizations ? JSON.stringify(item.customizations) : null]
+        );
+      }
+      
+      // Create income entry for paid orders
+      await conn.query(
+        `INSERT INTO income_expenses (type, category, description, amount, date, user_id)
+         VALUES (?,?,?,?,?,?)`,
+        ['income', 'Sales', `Order #${orderId} Payment`, total, now, Number(req.user.id)]
+      );
+    }
+    
+    await conn.commit();
+    res.json({ id: req.params.id, paymentStatus, paymentMethod });
+  } catch (error) {
+    await conn.rollback();
+    res.status(500).json({ message: 'Server error', error: error.message });
+  } finally {
+    conn.release();
   }
 });
 
@@ -743,7 +859,7 @@ app.put('/api/customers/:id/points', authenticateToken, async (req, res) => {
 // Reports Routes
 app.get('/api/reports/sales-summary', authenticateToken, async (req, res) => {
   try {
-    const { period, startDate: qsStart, endDate: qsEnd } = req.query; // 'daily' | 'monthly' or explicit range
+    const { period, startDate: qsStart, endDate: qsEnd, category } = req.query; // 'daily' | 'monthly' or explicit range
     const now = moment();
     let startDate, endDate;
     if (qsStart && qsEnd) {
@@ -785,6 +901,72 @@ app.get('/api/reports/sales-summary', authenticateToken, async (req, res) => {
       orderParams
     );
 
+    // Get detailed item sales data
+    let itemWhere = txWhere.replace('date', 't.date');
+    let itemParams = txParams;
+    if (!itemWhere) {
+      if (period === 'daily') {
+        itemWhere = 'WHERE DATE(t.date) = CURDATE()';
+        itemParams = [];
+      } else {
+        itemWhere = 'WHERE YEAR(t.date) = YEAR(CURDATE()) AND MONTH(t.date) = MONTH(CURDATE())';
+        itemParams = [];
+      }
+    }
+
+    // Category filter for items
+    let categoryFilter = '';
+    if (category) {
+      categoryFilter = ' AND p.category = ?';
+      itemParams.push(category);
+    }
+
+    const [itemsRows] = await pool.query(`
+      SELECT 
+        ti.product_name AS productName,
+        ti.product_id AS productId,
+        p.category,
+        SUM(ti.quantity) AS totalQuantity,
+        SUM(ti.quantity * ti.price) AS totalRevenue,
+        AVG(ti.price) AS avgPrice,
+        COUNT(DISTINCT t.id) AS orderCount
+      FROM transaction_items ti
+      JOIN transactions t ON ti.transaction_id = t.id
+      LEFT JOIN products p ON ti.product_id = p.id
+      ${itemWhere}${categoryFilter}
+      GROUP BY ti.product_id, ti.product_name
+      ORDER BY totalQuantity DESC
+    `, itemParams);
+
+    // Get category breakdown
+    const [categoryRows] = await pool.query(`
+      SELECT 
+        COALESCE(p.category, 'Unknown') AS category,
+        SUM(ti.quantity) AS totalQuantity,
+        SUM(ti.quantity * ti.price) AS totalRevenue,
+        COUNT(DISTINCT ti.product_id) AS uniqueProducts
+      FROM transaction_items ti
+      JOIN transactions t ON ti.transaction_id = t.id
+      LEFT JOIN products p ON ti.product_id = p.id
+      ${itemWhere}
+      GROUP BY p.category
+      ORDER BY totalRevenue DESC
+    `, txParams);
+
+    // Get hourly sales data for the period
+    const [hourlyRows] = await pool.query(`
+      SELECT 
+        HOUR(t.date) AS hour,
+        COUNT(*) AS transactionCount,
+        SUM(t.total) AS revenue,
+        SUM(ti.quantity) AS itemsSold
+      FROM transactions t
+      LEFT JOIN transaction_items ti ON t.id = ti.transaction_id
+      ${txWhere}
+      GROUP BY HOUR(t.date)
+      ORDER BY hour
+    `, txParams);
+
     const totalRevenue = txRows.reduce((sum, t) => sum + Number(t.total), 0);
     const totalExpenses = ieRows.filter(ie => ie.type === 'expense').reduce((sum, ie) => sum + Number(ie.amount), 0);
     const additionalIncome = ieRows.filter(ie => ie.type === 'income').reduce((sum, ie) => sum + Number(ie.amount), 0);
@@ -797,6 +979,10 @@ app.get('/api/reports/sales-summary', authenticateToken, async (req, res) => {
 
     const orderCount = orderRows.length;
     const orderTotal = orderRows.reduce((sum, o) => sum + Number(o.total), 0);
+
+    // Calculate total items sold
+    const totalItemsSold = itemsRows.reduce((sum, item) => sum + Number(item.totalQuantity), 0);
+    const averageOrderValue = transactionCount > 0 ? totalRevenue / transactionCount : 0;
 
     // Breakdowns
     const incomeByCategory = ieRows
@@ -826,11 +1012,216 @@ app.get('/api/reports/sales-summary', authenticateToken, async (req, res) => {
       unpaidTransactionCount,
       orderCount,
       orderTotal,
+      totalItemsSold,
+      averageOrderValue,
       incomeByCategory,
       expenseByCategory,
+      itemsSold: itemsRows.map(item => ({
+        productName: item.productName,
+        productId: item.productId ? String(item.productId) : null,
+        category: item.category,
+        quantity: Number(item.totalQuantity),
+        revenue: Number(item.totalRevenue),
+        avgPrice: Number(item.avgPrice),
+        orderCount: Number(item.orderCount)
+      })),
+      categoryBreakdown: categoryRows.map(cat => ({
+        category: cat.category,
+        quantity: Number(cat.totalQuantity),
+        revenue: Number(cat.totalRevenue),
+        uniqueProducts: Number(cat.uniqueProducts)
+      })),
+      hourlyData: hourlyRows.map(hour => ({
+        hour: Number(hour.hour),
+        transactionCount: Number(hour.transactionCount),
+        revenue: Number(hour.revenue),
+        itemsSold: Number(hour.itemsSold)
+      }))
     });
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Delete order
+app.delete('/api/orders/:id', authenticateToken, async (req, res) => {
+  const pool = getPool();
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    
+    const orderId = req.params.id;
+    
+    // Check if order exists
+    const [orderRows] = await conn.query('SELECT * FROM orders WHERE id = ?', [orderId]);
+    if (orderRows.length === 0) {
+      return res.status(404).json({ message: 'Order not found' });
+    }
+    
+    // Note: Transactions are not directly linked to orders in this schema
+    // They are separate entities created during payment processing
+    // So we only delete the order itself
+    
+    // Delete the order
+    await conn.query('DELETE FROM orders WHERE id = ?', [orderId]);
+    
+    await conn.commit();
+    res.json({ message: 'Order deleted successfully' });
+  } catch (error) {
+    await conn.rollback();
+    res.status(500).json({ message: 'Server error', error: error.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// Check if product is used in orders
+app.get('/api/products/:id/orders', authenticateToken, async (req, res) => {
+  try {
+    const pool = getPool();
+    const productId = req.params.id;
+    
+    // Check orders that contain this product
+    const [orderRows] = await pool.query(`
+      SELECT DISTINCT o.id, o.table_number, o.status, o.created_at, o.total
+      FROM orders o
+      WHERE JSON_CONTAINS(o.items, JSON_OBJECT('productId', ?))
+      ORDER BY o.created_at DESC
+    `, [productId]);
+    
+    res.json({
+      hasOrders: orderRows.length > 0,
+      orders: orderRows.map(order => ({
+        id: order.id,
+        tableNumber: order.table_number,
+        status: order.status,
+        createdAt: order.created_at,
+        total: Number(order.total)
+      }))
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Delete product
+app.delete('/api/products/:id', authenticateToken, async (req, res) => {
+  const pool = getPool();
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    
+    const productId = req.params.id;
+    
+    // Check if product exists
+    const [productRows] = await conn.query('SELECT * FROM products WHERE id = ?', [productId]);
+    if (productRows.length === 0) {
+      return res.status(404).json({ message: 'Product not found' });
+    }
+    
+    // Check if force delete is requested
+    const { force } = req.query;
+    
+    if (force === 'true') {
+      // Delete orders that contain this product
+      const [orderRows] = await conn.query(`
+        SELECT id FROM orders 
+        WHERE JSON_CONTAINS(items, JSON_OBJECT('productId', ?))
+      `, [productId]);
+      
+      for (const order of orderRows) {
+        // Note: Transactions are not directly linked to orders in this schema
+        // They are separate entities, so we only delete the orders
+        await conn.query('DELETE FROM orders WHERE id = ?', [order.id]);
+      }
+      
+      // Delete transaction items that reference this product
+      await conn.query('DELETE FROM transaction_items WHERE product_id = ?', [productId]);
+      
+      // Delete product option values and groups
+      await conn.query('DELETE pov FROM product_option_values pov JOIN product_option_groups pog ON pov.group_id = pog.id WHERE pog.product_id = ?', [productId]);
+      await conn.query('DELETE FROM product_option_groups WHERE product_id = ?', [productId]);
+    } else {
+      // Check if product is referenced in transaction_items
+      const [txItemsRows] = await conn.query('SELECT COUNT(*) as count FROM transaction_items WHERE product_id = ?', [productId]);
+      if (txItemsRows[0].count > 0) {
+        return res.status(400).json({ 
+          message: 'Cannot delete product: it is referenced in transaction history. Use force delete to remove all related data.',
+          hasTransactionItems: true
+        });
+      }
+      
+      // Check for option groups/values and delete them first
+      await conn.query('DELETE pov FROM product_option_values pov JOIN product_option_groups pog ON pov.group_id = pog.id WHERE pog.product_id = ?', [productId]);
+      await conn.query('DELETE FROM product_option_groups WHERE product_id = ?', [productId]);
+    }
+    
+    // Delete the product
+    await conn.query('DELETE FROM products WHERE id = ?', [productId]);
+    
+    await conn.commit();
+    res.json({ message: 'Product deleted successfully' });
+  } catch (error) {
+    await conn.rollback();
+    res.status(500).json({ message: 'Server error', error: error.message });
+  } finally {
+    conn.release();
+  }
+});
+
+// Update income/expense entry
+app.put('/api/income-expenses/:id', authenticateToken, async (req, res) => {
+  try {
+    const pool = getPool();
+    const { type, category, description, amount } = req.body;
+    const id = req.params.id;
+    
+    await pool.query(
+      'UPDATE income_expenses SET type = ?, category = ?, description = ?, amount = ? WHERE id = ?',
+      [type, category, description, amount, id]
+    );
+    
+    res.json({ message: 'Entry updated successfully' });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Delete income/expense entry
+app.delete('/api/income-expenses/:id', authenticateToken, async (req, res) => {
+  try {
+    const pool = getPool();
+    const id = req.params.id;
+    
+    await pool.query('DELETE FROM income_expenses WHERE id = ?', [id]);
+    res.json({ message: 'Entry deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Bulk delete income/expense entries
+app.delete('/api/income-expenses/bulk', authenticateToken, async (req, res) => {
+  const pool = getPool();
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ message: 'Invalid or empty IDs array' });
+    }
+    
+    const placeholders = ids.map(() => '?').join(',');
+    await conn.query(`DELETE FROM income_expenses WHERE id IN (${placeholders})`, ids);
+    
+    await conn.commit();
+    res.json({ message: `${ids.length} entries deleted successfully` });
+  } catch (error) {
+    await conn.rollback();
+    res.status(500).json({ message: 'Server error', error: error.message });
+  } finally {
+    conn.release();
   }
 });
 
@@ -844,6 +1235,7 @@ initializeDatabase()
     try {
       await ensureUsersTableAndDefaults();
       await ensureTransactionsSchema();
+      await ensureOrdersSchema();
     } catch (e) {
       console.error('User seeding failed:', e);
     }
